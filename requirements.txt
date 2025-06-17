@@ -1,0 +1,21 @@
+# FastAPI dan Uvicorn
+fastapi[all]
+uvicorn[standard]
+
+# Database
+pymongo
+
+# Konfigurasi
+python-dotenv
+
+# Image processing
+opencv-python-headless
+numpy
+pillow
+
+# Ollama (versi terbaru dari GitHub karena tidak tersedia di PyPI lama)
+git+https://github.com/ollama/ollama-python 
+
+# HTTP client
+requests
+asyncpg

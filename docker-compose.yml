@@ -1,0 +1,34 @@
+version: "3.8"
+
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ~/.ollama:/root/.ollama
+    networks:
+      - vision-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: app-service
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - ollama
+    volumes:
+      - ./:/app
+    ports:
+      - "8000:8000"
+    networks:
+      - vision-net
+
+networks:
+  vision-net:
+    driver: bridge

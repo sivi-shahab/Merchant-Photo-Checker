@@ -1,0 +1,269 @@
+import os
+import re
+import cv2
+import time
+import base64
+import tempfile
+import numpy as np
+import ollama
+import asyncpg
+
+from pymongo import MongoClient
+from app.config import settings
+from app.logger import logger
+import datetime
+
+# Initialize MongoDB client (tidak berubah)
+mongo_client = MongoClient(settings.MONGO_URI)
+mongo_db = mongo_client[settings.MONGO_DB]
+mongo_collection = mongo_db[settings.MONGO_COLLECTION]
+
+class ImageProcessor:
+    def __init__(self, mongo_collection=mongo_collection, postgres_pool=None):
+        self.mongo_collection = mongo_collection
+        self.start_time = time.time()
+        self.ollama_client = ollama.Client(host=str(settings.OLLAMA_BASE_URL))
+        self.postgres_pool = postgres_pool  # ← Pool Postgres
+
+    def get_document_by_reffid(self, reffid: str) -> dict:
+        """
+        Retrieve the MongoDB document for a given reffid.
+        """
+        return self.mongo_collection.find_one({"reffid": reffid})
+
+    async def process_image_with_ollama_chat(self, image_base64: str) -> dict:
+        try:
+            if image_base64.startswith('data:image'):
+                base64_data = image_base64.split(',', 1)[1]
+            else:
+                base64_data = image_base64
+
+            # with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            #     tmp.write(base64.b64decode(base64_data))
+            #     tmp_path = tmp.name
+
+            prompt = (
+                "You are an expert retail auditor.\n"
+                "Analyze the provided image to find and extract the MAIN STORE NAME ONLY, following these steps:\n"
+                "1. Detect ALL banners, signage, or billboards that might indicate the name of the store.\n"
+                "2. Identify the largest or most prominent signage, ignoring product brands, promotional offers, or advertisements.\n"
+                "3. Perform OCR only on the most prominent signage.\n"
+                "4. Ignore all text related to discounts, products, services, prices, taglines, or any promotional information.\n"
+                "5. Extract ONLY the store name as it appears on the main signage, without extra information or descriptors.\n"
+                "6. If no clear store name is visible, respond with {result: \"null\"}.\n"
+                "7. Return your answer in **exactly** this JSON format (no explanation, no extra text):\n"
+                "{result: \"STORE_NAME\"}\n"
+            )
+
+            response = ollama.chat(
+                model='llama3.2-vision',
+                messages=[{
+                    'role': 'user',
+                    'content': prompt,
+                    'images': [base64_data ]
+                }]
+            )
+
+            # os.unlink(tmp_path)
+
+            content = (
+                response.get("message", {}).get("content", "")
+                or response.get("response", "")
+            )
+            store_name = self.extract_store_name(content) if content else ""
+
+            return {
+                "result": store_name,
+                "raw_response": content if not store_name else None
+            }
+
+        except Exception as e:
+            logger.error(f"Error in process_image_with_ollama_chat: {str(e)}")
+            return {
+                "error": "OCR processing failed",
+                "details": str(e)
+            }
+
+    async def process_image_with_ollama(self, image_base64: str) -> dict:
+        try:
+            if image_base64.startswith('data:image'):
+                base64_data = image_base64.split(',', 1)[1]
+            else:
+                base64_data = image_base64
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(base64.b64decode(base64_data))
+                tmp_path = tmp.name
+
+            response = self.ollama_client.generate(
+                model=settings.OLLAMA_MODEL,
+                prompt=(
+                    "You are an expert retail auditor.\n"
+                    "Analyze the provided image to find and extract the MAIN STORE NAME ONLY, following these steps:\n"
+                    "1. Detect ALL banners, signage, or billboards that might indicate the name of the store.\n"
+                    "2. Identify the largest or most prominent signage, ignoring product brands, promotional offers, or advertisements.\n"
+                    "3. Perform OCR only on the most prominent signage.\n"
+                    "4. Ignore all text related to discounts, products, services, prices, taglines, or any promotional information.\n"
+                    "5. Extract ONLY the store name as it appears on the main signage, without extra information or descriptors.\n"
+                    "6. If no clear store name is visible, respond with {result: \"null\"}.\n"
+                    "7. Return your answer in **exactly** this JSON format (no explanation, no extra text):\n"
+                    "{result: \"STORE_NAME\"}\n"
+                ),
+                images=[tmp_path]
+            )
+
+            os.unlink(tmp_path)
+
+            content = response.get("response", "")
+            store_name = self.extract_store_name(content) if content else ""
+
+            return {
+                "result": store_name,
+                "raw_response": content if not store_name else None
+            }
+
+        except Exception as e:
+            logger.error(f"Error in process_image_with_ollama: {str(e)}")
+            return {
+                "error": "OCR processing failed",
+                "details": str(e)
+            }
+
+    def extract_store_name(self, response_text: str) -> str:
+        match = re.search(r"\{result:\s*\"([^\"]+)\"\}", response_text)
+        return match.group(1).strip() if match else "null"
+
+    async def update_ocr_store_names(self, pool, reffid, ocr_results):
+        store_names = []
+        for r in ocr_results[:3]:
+            val = r.get("ocr_result")
+            store_names.append(None if val in (None, "null", "") else val)
+        while len(store_names) < 3:
+            store_names.append(None)
+        
+        ocr_processed_date = datetime.datetime.now()
+
+        query = """
+            UPDATE public.mpos_company_profile
+            SET ocr_store_name_1 = $1,
+                ocr_store_name_2 = $2,
+                ocr_store_name_3 = $3,
+                ocr_processed_date = $4
+            WHERE reffid = $5
+        """
+        async with pool.acquire() as conn:
+            await conn.execute(query, store_names[0], store_names[1], store_names[2], ocr_processed_date, reffid)
+
+    async def update_blur_scores(self, pool, reffid, blur_results):
+        blur_scores = []
+        for r in blur_results[:3]:
+            val = r.get("blur_result", {}).get("quality_level")
+            blur_scores.append(None if not val else val)
+        while len(blur_scores) < 3:
+            blur_scores.append(None)
+        
+        blur_processed_date = datetime.datetime.now()
+        query = """
+            UPDATE public.mpos_company_profile
+            SET blur_score_1 = $1,
+                blur_score_2 = $2,
+                blur_score_3 = $3,
+                blur_processed_date = $4
+            WHERE reffid = $5
+        """
+        async with pool.acquire() as conn:
+            await conn.execute(query, blur_scores[0], blur_scores[1], blur_scores[2],  blur_processed_date, reffid)
+
+    def detect_image_blur(self, image_path: str) -> dict:
+        image = cv2.imread(image_path)
+        if image is None:
+            return {"error": "Could not load image"}
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        fft = np.fft.fft2(gray)
+        fft_shift = np.fft.fftshift(fft)
+        h, w = gray.shape
+        fft_shift[h//2-30:h//2+30, w//2-30:w//2+30] = 0
+        recon = np.fft.ifft2(np.fft.ifftshift(fft_shift))
+        fft_score = np.mean(20 * np.log(np.abs(recon) + 1e-8))
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sobel_score = np.mean(np.sqrt(sobel_x**2 + sobel_y**2))
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_magnitude = np.mean(np.sqrt(grad_x**2 + grad_y**2))
+
+        thresholds = {
+            'lap_low': 100, 'lap_high': 1000,
+            'fft_low': 20, 'fft_high': 50,
+            'sobel_low': 20, 'sobel_high': 50,
+            'grad_low': 10, 'grad_high': 30
+        }
+
+        def normalize(value, low, high):
+            if value >= high:
+                return 100.0
+            if value <= low:
+                return 0.0
+            return ((value - low) / (high - low)) * 100.0
+
+        lap_n = normalize(laplacian_var, thresholds['lap_low'], thresholds['lap_high'])
+        fft_n = normalize(fft_score, thresholds['fft_low'], thresholds['fft_high'])
+        sobel_n = normalize(sobel_score, thresholds['sobel_low'], thresholds['sobel_high'])
+        grad_n = normalize(gradient_magnitude, thresholds['grad_low'], thresholds['grad_high'])
+
+        weights = {'laplacian': 0.4, 'fft': 0.3, 'sobel': 0.2, 'gradient': 0.1}
+        sharpness_score = (
+            lap_n * weights['laplacian'] +
+            fft_n * weights['fft'] +
+            sobel_n * weights['sobel'] +
+            grad_n * weights['gradient']
+        )
+
+        if sharpness_score >= 70:
+            classification = 'sharp'
+            confidence = min(100.0, sharpness_score)
+        elif sharpness_score <= 30:
+            classification = 'blur'
+            confidence = min(100.0, 100 - sharpness_score)
+        else:
+            classification = 'moderate_sharp' if sharpness_score > 50 else 'moderate_blur'
+            confidence = abs(sharpness_score - 50) * 2
+
+        blur_pct = 100 - confidence if classification in ('sharp', 'moderate_sharp') else confidence
+        sharp_pct = confidence if classification in ('sharp', 'moderate_sharp') else 100 - confidence
+
+        return {
+            'raw_scores': {
+                'laplacian': round(laplacian_var, 2),
+                'fft': round(fft_score, 2),
+                'sobel': round(sobel_score, 2),
+                'gradient': round(gradient_magnitude, 2)
+            },
+            'normalized_scores': {
+                'laplacian': round(lap_n, 2),
+                'fft': round(fft_n, 2),
+                'sobel': round(sobel_n, 2),
+                'gradient': round(grad_n, 2)
+            },
+            'sharpness_score': round(sharpness_score, 2),
+            'classification': classification,
+            'confidence': round(confidence, 2),
+            'percentages': {
+                'sharp': round(sharp_pct, 2),
+                'blur': round(blur_pct, 2)
+            },
+            'quality_level': self._get_quality_level(sharpness_score)
+        }
+
+    def _get_quality_level(self, score: float) -> str:
+        if score >= 85:
+            return 'excellent'
+        if score >= 70:
+            return 'good'
+        if score >= 50:
+            return 'fair'
+        if score >= 30:
+            return 'poor'
+        return 'very_poor'
