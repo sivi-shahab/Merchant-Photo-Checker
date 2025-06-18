@@ -1,6 +1,6 @@
 import asyncpg
 import asyncio
-from fastapi import APIRouter, HTTPException, Query, FastAPI
+from fastapi import APIRouter, HTTPException, Query, FastAPI,  UploadFile, File
 from pymongo import MongoClient
 from app.processor import ImageProcessor
 from app.utils import decode_image_base64_to_tempfile
@@ -225,6 +225,70 @@ async def ocr_images_by_reffid(reffid: str):
 #         logger.error(f"Error in OCR endpoint for reffid {reffid}: {str(e)}")
 #         raise HTTPException(status_code=500, detail=str(e))
     
+# @router.get("/ocr_merchant/{reffid}")
+# async def ocr_images_by_reffid(reffid: str):
+#     """
+#     Process OCR for all validated images associated with a given reffid.
+#     Returns OCR results and updates MongoDB + Postgres with the results.
+#     """
+#     try:
+#         # Fetch document
+#         doc = processor.get_document_by_reffid(reffid)
+#         if not doc:
+#             raise HTTPException(status_code=404, detail="Reffid not found in MongoDB")
+
+#         images = doc.get("images", [])
+#         ocr_results = []
+
+#         for image_data in images:
+#             if not image_data.get("validated"):
+#                 continue
+
+#             try:
+#                 # Ensure base64 prefix
+#                 b64 = image_data["image_base64"]
+#                 if not b64.startswith('data:image'):
+#                     b64 = f"data:image/jpeg;base64,{b64}"
+
+#                 ocr = await processor.process_image_with_ollama(b64)
+
+#                 # Update MongoDB
+#                 upd = processor.mongo_collection.update_one(
+#                     {"reffid": reffid, "images.elk_id": image_data["elk_id"]},
+#                     {"$set": {"images.$.ocr_result": ocr.get("result", "")}}
+#                 )
+
+#                 ocr_results.append({
+#                     "elk_id": image_data["elk_id"],
+#                     "ocr_result": ocr.get("result", ""),
+#                     "updated": upd.modified_count > 0
+#                 })
+
+#             except Exception as img_err:
+#                 logger.error(f"Error processing image {image_data.get('elk_id')}: {img_err}")
+#                 ocr_results.append({
+#                     "elk_id": image_data.get("elk_id"),
+#                     "error": "Failed to process image",
+#                     "details": str(img_err)
+#                 })
+
+#         # Persist merchant names in Postgres if needed
+#         await processor.update_ocr_store_names(processor.postgres_pool, reffid, ocr_results)
+
+#         return {
+#             "reffid": reffid,
+#             "total_images": len(images),
+#             "processed_images": len(ocr_results),
+#             "ocr_results": ocr_results
+#         }
+
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         logger.error(f"Error in OCR endpoint for reffid {reffid}: {e}")
+#         raise HTTPException(status_code=500, detail="Internal server error")
+    
+    
 @router.get("/ocr_merchant/{reffid}")
 async def ocr_images_by_reffid(reffid: str):
     """
@@ -245,21 +309,20 @@ async def ocr_images_by_reffid(reffid: str):
                 continue
 
             try:
-                # Ensure base64 prefix
-                b64 = image_data["image_base64"]
-                if not b64.startswith('data:image'):
-                    b64 = f"data:image/jpeg;base64,{b64}"
+                # Get raw base64 (may include prefix)
+                b64 = image_data.get("image_base64", "")
 
+                # Call updated processor (strips prefix internally)
                 ocr = await processor.process_image_with_ollama(b64)
 
                 # Update MongoDB
                 upd = processor.mongo_collection.update_one(
-                    {"reffid": reffid, "images.elk_id": image_data["elk_id"]},
-                    {"$set": {"images.$.ocr_result": ocr.get("result", "")}}
+                    {"reffid": reffid, "images.elk_id": image_data.get("elk_id")},
+                    {"$set": {"images.$.ocr_result": ocr.get("result", "")} }
                 )
 
                 ocr_results.append({
-                    "elk_id": image_data["elk_id"],
+                    "elk_id": image_data.get("elk_id"),
                     "ocr_result": ocr.get("result", ""),
                     "updated": upd.modified_count > 0
                 })
@@ -272,7 +335,7 @@ async def ocr_images_by_reffid(reffid: str):
                     "details": str(img_err)
                 })
 
-        # Persist merchant names in Postgres if needed
+        # Persist to Postgres
         await processor.update_ocr_store_names(processor.postgres_pool, reffid, ocr_results)
 
         return {
@@ -417,3 +480,34 @@ async def batch_detect_blur_by_created_date(start_date: str = Query(...), end_da
         "total_reffids": len(batch_results),
         "batch_blur_results": batch_results
     }
+    
+@router.post("/ocr", summary="Perform OCR on an uploaded image")
+async def ocr_image(file: UploadFile = File(...)):
+    # Validasi tipe file
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload an image.")
+    try:
+        result = await processor.process_image_with_ollama_chat_image(file)
+        return result
+    except Exception as e:
+        logger.error(f"OCR endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal OCR processing error")
+
+@router.post("/ocr_llava", summary="OCR dari file gambar")
+async def ocr_upload(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(400, "Harap upload file gambar")
+    return await processor.process_image_with_ollama_from_file(file)
+
+
+@router.post("/llava", summary="OCR via LLava (ollama-python)")
+async def ocr_llava(file: UploadFile = File(...)):
+    # 1. Validasi tipe file
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Harap upload file gambar saja.")
+    # 2. Proses dengan LLavaProcessor
+    result = await processor.process_image_llava(file)
+    # 3. Jika error, konversi ke HTTPException
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["details"])
+    return result
