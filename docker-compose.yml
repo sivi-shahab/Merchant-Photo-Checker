@@ -20,6 +20,8 @@ services:
     restart: always
     env_file:
       - .env
+    # environment:
+    #   - =value
     depends_on:
       - ollama
     volumes:

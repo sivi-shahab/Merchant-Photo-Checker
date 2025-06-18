@@ -3,6 +3,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+
 # Install git dan dependensi tambahan (untuk OpenCV dll)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git libgl1 libsm6 && \

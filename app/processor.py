@@ -32,49 +32,72 @@ class ImageProcessor:
         return self.mongo_collection.find_one({"reffid": reffid})
 
     async def process_image_with_ollama_chat(self, image_base64: str) -> dict:
+        # Debugging logs
+        logger.debug(f"Ollama URL: {settings.OLLAMA_BASE_URL}")
+        logger.debug(f"Ollama model: {settings.OLLAMA_MODEL}")
         try:
             if image_base64.startswith('data:image'):
                 base64_data = image_base64.split(',', 1)[1]
             else:
                 base64_data = image_base64
 
-            # with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            #     tmp.write(base64.b64decode(base64_data))
-            #     tmp_path = tmp.name
+            # 2. Decode & write to temp file
+            img_bytes = base64.b64decode(base64_data)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
 
-            prompt = (
-                "You are an expert retail auditor.\n"
-                "Analyze the provided image to find and extract the MAIN STORE NAME ONLY, following these steps:\n"
-                "1. Detect ALL banners, signage, or billboards that might indicate the name of the store.\n"
-                "2. Identify the largest or most prominent signage, ignoring product brands, promotional offers, or advertisements.\n"
-                "3. Perform OCR only on the most prominent signage.\n"
-                "4. Ignore all text related to discounts, products, services, prices, taglines, or any promotional information.\n"
-                "5. Extract ONLY the store name as it appears on the main signage, without extra information or descriptors.\n"
-                "6. If no clear store name is visible, respond with {result: \"null\"}.\n"
-                "7. Return your answer in **exactly** this JSON format (no explanation, no extra text):\n"
-                "{result: \"STORE_NAME\"}\n"
+            prompt = ("""
+                    Analyze the image and extract store information following these steps:  
+                    1. Identify all banners/signage/billboards in the image.  
+                    2. Detect and select the largest/most prominent banner or signage or billboard.  
+                    3. Perform OCR on the selected largest banner/signage/billboard.
+                    4. Ignore all advertisements, promotional text, product brand in banner/signage/billboard.
+                    5. Extract ONLY the store name from the banner/signage/billboard.
+                    6. Return the result in exactly this format (do not modify the format):
+                    {result: "STORE_NAME"}
+
+                    Examples:
+                    For a store "BUDI JAYA":
+                    {result: "BUDI JAYA"}
+
+                    For a store "TOKO BERKAH":
+                    {result: "TOKO BERKAH"}
+
+                    If no store name is found:
+                    {result: "null"}
+
+                    Important:
+                    - Return ONLY the exact store name as seen on the banner/signage
+                    - Do not include any steps, analysis, or additional text
+                    - The response should contain ONLY the {result: "STORE_NAME"} format
+                """
             )
 
-            response = ollama.chat(
-                model='llama3.2-vision',
+            # 4. Call module-level API (supports images=[])
+            response = self.ollama_client.chat(
+                model=settings.OLLAMA_MODEL,
                 messages=[{
-                    'role': 'user',
-                    'content': prompt,
-                    'images': [base64_data ]
-                }]
-            )
+                'role': 'user',
+                'content': prompt,
+                'images': [tmp_path]
+            }],
+        )
+            os.unlink(tmp_path)
+            # 6. Parse the first choice’s content
+            choices = response.get('choices', [])
+            content = ""
+            if choices:
+                content = choices[0].get('message', {}).get('content', "")
+            else:
+                # fallback if the API returns a top-level 'response'
+                content = response.get('response', "")
+            store_name = self.extract_store_name(content)
 
-            # os.unlink(tmp_path)
-
-            content = (
-                response.get("message", {}).get("content", "")
-                or response.get("response", "")
-            )
-            store_name = self.extract_store_name(content) if content else ""
-
+            
             return {
                 "result": store_name,
-                "raw_response": content if not store_name else None
+                "raw_response": None if store_name != "null" else content
             }
 
         except Exception as e:
