@@ -97,10 +97,22 @@ async def ocr_images_by_reffid(reffid: str):
 
         images = doc.get("images", [])
         # Filter only validated images
-        valid_images = [
-            img for img in images
-            if img.get("validated") and img.get("image_base64")
-        ]
+        valid_images = []
+        for img in images:
+            b64 = img.get("image_base64")
+            if isinstance(b64, str) and b64.strip():
+                valid_images.append(img)
+
+        # Jika tidak ada gambar valid, langsung return summary
+        if not valid_images:
+            print("Tidak ada image yang valid")
+            return {
+                "reffid": reffid,
+                "total_images": len(images),
+                "validated_images": 0,
+                "processed_images": 0,
+                "ocr_results": []
+            }
 
         # 2. Process each image in parallel
         async def handle_image(image_data):
@@ -153,7 +165,7 @@ async def ocr_images_by_reffid(reffid: str):
         raise HTTPException(status_code=500, detail="Internal OCR processing error")
 
 
-# @router.get("/ocr/{reffid}")
+# @router.get("/ocr_merchant/{reffid}")
 # async def ocr_images_by_reffid(reffid: str):
 #     """
 #     Process OCR for all validated images associated with a given reffid.
@@ -178,8 +190,8 @@ async def ocr_images_by_reffid(reffid: str):
 #                 if not base64_str.startswith('data:image'):
 #                     base64_str = f"data:image/jpeg;base64,{base64_str}"
 
-#                 # ocr_result = await processor.process_image_with_ollama(base64_str)
-#                 ocr_result = await processor.process_image_with_ollama_chat(base64_str)
+#                 ocr_result = await processor.process_image_with_ollama(base64_str)
+                
 
 #                 # Update MongoDB with OCR result
 #                 update_result = processor.mongo_collection.update_one(
@@ -212,6 +224,69 @@ async def ocr_images_by_reffid(reffid: str):
 #     except Exception as e:
 #         logger.error(f"Error in OCR endpoint for reffid {reffid}: {str(e)}")
 #         raise HTTPException(status_code=500, detail=str(e))
+    
+@router.get("/ocr_merchant/{reffid}")
+async def ocr_images_by_reffid(reffid: str):
+    """
+    Process OCR for all validated images associated with a given reffid.
+    Returns OCR results and updates MongoDB + Postgres with the results.
+    """
+    try:
+        # Fetch document
+        doc = processor.get_document_by_reffid(reffid)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Reffid not found in MongoDB")
+
+        images = doc.get("images", [])
+        ocr_results = []
+
+        for image_data in images:
+            if not image_data.get("validated"):
+                continue
+
+            try:
+                # Ensure base64 prefix
+                b64 = image_data["image_base64"]
+                if not b64.startswith('data:image'):
+                    b64 = f"data:image/jpeg;base64,{b64}"
+
+                ocr = await processor.process_image_with_ollama(b64)
+
+                # Update MongoDB
+                upd = processor.mongo_collection.update_one(
+                    {"reffid": reffid, "images.elk_id": image_data["elk_id"]},
+                    {"$set": {"images.$.ocr_result": ocr.get("result", "")}}
+                )
+
+                ocr_results.append({
+                    "elk_id": image_data["elk_id"],
+                    "ocr_result": ocr.get("result", ""),
+                    "updated": upd.modified_count > 0
+                })
+
+            except Exception as img_err:
+                logger.error(f"Error processing image {image_data.get('elk_id')}: {img_err}")
+                ocr_results.append({
+                    "elk_id": image_data.get("elk_id"),
+                    "error": "Failed to process image",
+                    "details": str(img_err)
+                })
+
+        # Persist merchant names in Postgres if needed
+        await processor.update_ocr_store_names(processor.postgres_pool, reffid, ocr_results)
+
+        return {
+            "reffid": reffid,
+            "total_images": len(images),
+            "processed_images": len(ocr_results),
+            "ocr_results": ocr_results
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in OCR endpoint for reffid {reffid}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 
