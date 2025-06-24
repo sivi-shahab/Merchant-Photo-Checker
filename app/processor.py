@@ -13,11 +13,45 @@ from pymongo import MongoClient
 from app.config import settings
 from app.logger import logger
 import datetime
+# import logging
+import json
+import requests
+
+# logger = logging.getLogger(__name__)
 
 # Initialize MongoDB client (tidak berubah)
 mongo_client = MongoClient(settings.MONGO_URI)
 mongo_db = mongo_client[settings.MONGO_DB]
 mongo_collection = mongo_db[settings.MONGO_COLLECTION]
+
+SYSTEM_PROMPT = ("""
+You are a highly accurate OCR system specialized in extracting business names from images.
+Follow these exact steps:
+1. Analyze the image for any business name storefront, including shops, restaurants, food stalls, workshops, or service-based businesses displayed on buildings or banners.
+2. If no business name storefront is found, {"return" : "null"} example id card.
+3. Identify any text that represents a business name, such as shop, restaurant, food stall, workshop, or service business names on buildings or banners.
+4. Select the single most likely business name based on size, prominence, and location.
+**Do not description, analysis, commentary, reasoning, or hallucination— just return the result in the json format.**
+Output Format in json:
+{"result" : "<store name>"}
+{"result" : "null"}
+temperature=0.0
+
+Prioritize / Focus On:
+✓ Storefront signs
+✓ Business banners
+✓ Shop names on buildings
+✓ Restaurant names
+✓ Food‑stall names
+✓ Service‑business names
+
+Ignore:
+✗ Product names
+✗ Prices
+✗ Addresses
+✗ Phone numbers
+✗ General text or descriptions
+""")
 
 
 class ImageProcessor:
@@ -32,6 +66,97 @@ class ImageProcessor:
         Retrieve the MongoDB document for a given reffid.
         """
         return self.mongo_collection.find_one({"reffid": reffid})
+
+    def parse_response(response_text: str) -> str:
+        """
+        Gabungkan konten streaming dari Ollama, lalu cari blok JSON
+        { "result" : "<nama>" } — return hanya bagian itu.
+
+        Jika hasil sudah persis JSON, kembalikan langsung tanpa modifikasi.
+        """
+        try:
+            combined_result = []
+
+            for line in response_text.splitlines():
+                try:
+                    parsed = json.loads(line)
+                    content = parsed.get("message", {}).get("content", "")
+                    if content:
+                        combined_result.append(content)  # tidak .strip()
+                except json.JSONDecodeError:
+                    combined_result.append(line)
+
+            full_text = "".join(combined_result)
+
+            # 1) Jika hasil sudah bersih (hanya JSON), langsung return
+            full_json_re = r'^\s*\{\s*"result"\s*:\s*"[^"]*"\s*\}\s*$'
+            if re.match(full_json_re, full_text, flags=re.IGNORECASE):
+                return full_text.strip()
+
+            # 2) Jika ada campuran teks + JSON, ekstrak bagian JSON saja
+            snippet_re = r'\{\s*["\']result["\']\s*:\s*["\']([^"\']+)["\']\s*\}'
+            match = re.search(snippet_re, full_text)
+            if match:
+                value = match.group(1)
+                return f'{{ "result": "{value}" }}'
+
+            # 3) Tidak ditemukan
+            return None
+        except Exception as e:
+            print("⚠️ parse_response error:", str(e))
+            return None
+
+    def perform_ocr_from_base64(self, base64_image: str) -> str | None:
+        """Perform OCR and extract only the JSON result string."""
+        try:
+            response = requests.post(
+                "http://ollama:11434/api/chat",
+                json={
+                    "model": "llama3.2-vision",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": SYSTEM_PROMPT,
+                            "images": [base64_image],
+                        },
+                    ],
+                }
+            )
+
+            if response.status_code != 200:
+                print(f"❌ Error: {response.status_code} - {response.text}")
+                return None
+
+            # Gabungkan hasil streaming dari Ollama
+            combined_result = []
+            for line in response.text.splitlines():
+                try:
+                    parsed = json.loads(line)
+                    content = parsed.get("message", {}).get("content", "")
+                    if content:
+                        combined_result.append(content)
+                except json.JSONDecodeError:
+                    combined_result.append(line)
+
+            full_text = "".join(combined_result)
+
+            # Jika hasil sudah bersih
+            full_json_re = r'^\s*\{\s*"result"\s*:\s*"[^"]*"\s*\}\s*$'
+            if re.match(full_json_re, full_text, flags=re.IGNORECASE):
+                return full_text.strip()
+
+            # Jika masih ada narasi, ambil JSON-nya saja
+            snippet_re = r'\{\s*["\']result["\']\s*:\s*["\']([^"\']+)["\']\s*\}'
+            match = re.search(snippet_re, full_text)
+            if match:
+                value = match.group(1)
+                return f'{{ "result": "{value}" }}'
+
+            return None
+
+        except Exception as e:
+            print("⚠️ Exception:", str(e))
+            return None
 
     async def process_image_with_ollama_chat(self, image_base64: str) -> dict:
         # Debugging logs
@@ -48,62 +173,35 @@ class ImageProcessor:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
-
+                
+            logger.debug("Wrote temp file: %s", tmp_path)
             prompt = ("""
-Analyze the image and extract store information, including small street vendors and roadside stalls (toko kaki lima):
-
-1. Search for ANY visible text that could indicate a business name, including:
-   - Large storefront signs and banners
-   - Small handwritten signs on stalls or carts
-   - Text on umbrellas, tents, or temporary structures
-   - Names written on wooden boards, cardboard, or plastic signs
-   - Text on food carts, mobile vendors, or street stalls
-   - Names painted or written on walls, doors, or windows
-   - Text on fabric banners or cloth signs
-   - Even partial or faded text that might be readable
-
-2. Look specifically for street vendor indicators:
-   - Food cart names (e.g., "BAKSO PAK JOKO", "ES TEH MANIS IBU SARI")
-   - Stall names (e.g., "WARUNG NASI GUDEG", "KOPI ANGKRINGAN")
-   - Vendor names (e.g., "GORENGAN BU TINI", "RUJAK CINGUR PAK WAHYU")
-   - Product + owner names (e.g., "MIE AYAM BUDI", "SATE KAMBING HAJI ALI")
-
-3. Consider these text locations for kaki lima:
-   - On pushcarts or mobile stalls
-   - Handwritten signs on small boards
-   - Text on plastic tarps or cloth coverings
-   - Names on cooking equipment or containers
-   - Signs attached to motorcycles or bicycles
-   - Text on small umbrellas or parasols
-
-4. Text recognition guidelines:
-   - Accept handwritten text, even if not perfectly clear
-   - Include names with titles (Pak, Bu, Ibu, Bapak, Haji, etc.)
-   - Accept mixed language (Indonesian + local dialect)
-   - Consider abbreviated names (e.g., "WARTEG" for "Warung Tegal")
-
-5. Return null ONLY if:
-   - Image is completely unreadable (too blurry, dark, or corrupted)
-   - Absolutely no text or signage exists anywhere
-   - Image shows only products without any identifying text
-
-Return the result in exactly this format:
-{result: "STORE_NAME"}
-
-Examples for kaki lima:
-- Handwritten "Bakso Pak Joko": {result: "BAKSO PAK JOKO"}
-- Small sign "Warteg Bahari": {result: "WARTEG BAHARI"}
-- Text on cart "Es Teh Manis": {result: "ES TEH MANIS"}
-- Faded text "Nasi Gud_g Bu S_ri" (readable as Gudeg): {result: "NASI GUDEG BU SARI"}
-- Sign "Kopi Angkringan": {result: "KOPI ANGKRINGAN"}
-
-Important:
-- Be very inclusive - any readable business-related text counts
-- Don't ignore small, handwritten, or informal signage
-- Street vendors often have simple, direct naming
-- Include food type + owner name combinations
-- Return ONLY the {result: "STORE_NAME"} format
-""")
+                Analyze the image and extract store information following these steps:  
+                1. Identify all banners/signage/billboards in the image.  
+                2. Detect and select the largest/most prominent banner or signage or billboard.  
+                3. Perform OCR on the selected largest banner/signage/billboard.
+                4. Ignore all advertisements, promotional text, product brand in banner/signage/billboard.
+                5. Extract ONLY the store name from the banner/signage/billboard.
+                6. Return the result in exactly this format (do not modify the format):
+                {result: "STORE_NAME"}
+                
+                Examples:
+                For a store "BUDI JAYA":
+                {result: "BUDI JAYA"}
+                
+                For a store "TOKO BERKAH":
+                {result: "TOKO BERKAH"}
+                
+                If no store name is found:
+                {result: "null"}
+                
+                Important:
+                - Return ONLY the exact store name as seen on the banner/signage
+                - Do not include any steps, analysis, or additional text
+                - The response should contain ONLY the {result: "STORE_NAME"} format
+                """)
+            
+            logger.debug("Using prompt: %s", prompt.strip().replace("\n", " "))
 
             # 4. Call module-level API (supports images=[])
             response = self.ollama_client.chat(
@@ -114,16 +212,24 @@ Important:
                     'images': [tmp_path]
                 }],
             )
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+                logger.debug("Deleted temp file: %s", tmp_path)
+            except Exception as rm_err:
+                logger.warning("Failed to delete temp file %s: %s", tmp_path, rm_err)
             # 6. Parse the first choice’s content
             choices = response.get('choices', [])
+            logger.debug("Parsed choices: %s", choices)
             content = ""
             if choices:
                 content = choices[0].get('message', {}).get('content', "")
             else:
                 # fallback if the API returns a top-level 'response'
                 content = response.get('response', "")
+            logger.debug("Extracted content: %r", content)
             store_name = self.extract_store_name(content)
+            logger.debug("Parsed store_name: %r", store_name)
+
 
             return {
                 "result": store_name,
@@ -136,66 +242,6 @@ Important:
                 "error": "OCR processing failed",
                 "details": str(e)
             }
-
-    # async def process_image_with_ollama(self, image_base64: str) -> dict:
-    #     try:
-    #         if image_base64.startswith('data:image'):
-    #             base64_data = image_base64.split(',', 1)[1]
-    #         else:
-    #             base64_data = image_base64
-
-    #         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-    #             tmp.write(base64.b64decode(base64_data))
-    #             tmp_path = tmp.name
-
-    #         response = self.ollama_client.generate(
-    #             model="llava",
-    #             prompt = ("""
-    #                 Analyze the image and extract store information following these steps:
-    #                 1. Identify all banners/signage/billboards in the image.
-    #                 2. Detect and select the largest/most prominent banner or signage or billboard.
-    #                 3. Perform OCR on the selected largest banner/signage/billboard.
-    #                 4. Ignore all advertisements, promotional text, product brand in banner/signage/billboard.
-    #                 5. Extract ONLY the store name from the banner/signage/billboard.
-    #                 6. Return the result in exactly this format (do not modify the format):
-    #                 {result: "STORE_NAME"}
-
-    #                 Examples:
-    #                 For a store "BUDI JAYA":
-    #                 {result: "BUDI JAYA"}
-
-    #                 For a store "TOKO BERKAH":
-    #                 {result: "TOKO BERKAH"}
-
-    #                 If no store name is found:
-    #                 {result: "null"}
-
-    #                 Important:
-    #                 - Return ONLY the exact store name as seen on the banner/signage
-    #                 - Do not include any steps, analysis, or additional text
-    #                 - The response should contain ONLY the {result: "STORE_NAME"} format
-    #             """
-    #         ),
-
-    #             images=[tmp_path]
-    #         )
-
-    #         os.unlink(tmp_path)
-
-    #         content = response.get("response", "")
-    #         store_name = self.extract_store_name(content) if content else ""
-
-    #         return {
-    #             "result": store_name,
-    #             "raw_response": content if not store_name else None
-    #         }
-
-    #     except Exception as e:
-    #         logger.error(f"Error in process_image_with_ollama: {str(e)}")
-    #         return {
-    #             "error": "OCR processing failed",
-    #             "details": str(e)
-    #         }
 
     async def process_image_with_ollama_chat_image(self, image_file: UploadFile) -> dict:
         # Debugging logs
@@ -211,63 +257,28 @@ Important:
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
+            logger.debug("Wrote temp file: %s", tmp_path)
 
             # 3. Prompt tetap sama (tidak diubah)
             prompt = """
-    Analyze the image and extract store information, including small street vendors and roadside stalls (toko kaki lima):
+                    Analyze the image and extract store information following these steps:  
+                    1. Identify all banners/signage/billboards in the image.  
+                    2. Detect and select the largest/most prominent banner or signage or billboard.  
+                    3. Perform OCR on the selected largest banner/signage/billboard.
+                    4. Ignore all advertisements, promotional text, product brand in banner/signage/billboard.
+                    5. Extract ONLY the store name from the banner/signage/billboard.
+                    6. Return the result in exactly this format (do not modify the format):
+                    {result: "STORE_NAME"}
 
-    1. Search for ANY visible text that could indicate a business name, including:
-       - Large storefront signs and banners
-       - Small handwritten signs on stalls or carts
-       - Text on umbrellas, tents, or temporary structures
-       - Names written on wooden boards, cardboard, or plastic signs
-       - Text on food carts, mobile vendors, or street stalls
-       - Names painted or written on walls, doors, or windows
-       - Text on fabric banners or cloth signs
-       - Even partial or faded text that might be readable
+                    If no store name is found:
+                    {result: "null"}
 
-    2. Look specifically for street vendor indicators:
-       - Food cart names (e.g., "BAKSO PAK JOKO", "ES TEH MANIS IBU SARI")
-       - Stall names (e.g., "WARUNG NASI GUDEG", "KOPI ANGKRINGAN")
-       - Vendor names (e.g., "GORENGAN BU TINI", "RUJAK CINGUR PAK WAHYU")
-       - Product + owner names (e.g., "MIE AYAM BUDI", "SATE KAMBING HAJI ALI")
-
-    3. Consider these text locations for kaki lima:
-       - On pushcarts or mobile stalls
-       - Handwritten signs on small boards
-       - Text on plastic tarps or cloth coverings
-       - Names on cooking equipment or containers
-       - Signs attached to motorcycles or bicycles
-       - Text on small umbrellas or parasols
-
-    4. Text recognition guidelines:
-       - Accept handwritten text, even if not perfectly clear
-       - Include names with titles (Pak, Bu, Ibu, Bapak, Haji, etc.)
-       - Accept mixed language (Indonesian + local dialect)
-       - Consider abbreviated names (e.g., "WARTEG" for "Warung Tegal")
-
-    5. Return null ONLY if:
-       - Image is completely unreadable (too blurry, dark, or corrupted)
-       - Absolutely no text or signage exists anywhere
-       - Image shows only products without any identifying text
-
-    Return the result in exactly this format:
-    {result: "STORE_NAME"}
-
-    Examples for kaki lima:
-    - Handwritten "Bakso Pak Joko": {result: "BAKSO PAK JOKO"}
-    - Small sign "Warteg Bahari": {result: "WARTEG BAHARI"}
-    - Text on cart "Es Teh Manis": {result: "ES TEH MANIS"}
-    - Faded text "Nasi Gud_g Bu S_ri" (readable as Gudeg): {result: "NASI GUDEG BU SARI"}
-    - Sign "Kopi Angkringan": {result: "KOPI ANGKRINGAN"}
-
-    Important:
-    - Be very inclusive - any readable business-related text counts
-    - Don't ignore small, handwritten, or informal signage
-    - Street vendors often have simple, direct naming
-    - Include food type + owner name combinations
-    - Return ONLY the {result: "STORE_NAME"} format
-    """
+                    Important:
+                    - Return ONLY the exact store name as seen on the banner/signage
+                    - Do not include any steps, analysis, or additional text
+                    - The response should contain ONLY the {result: "STORE_NAME"} format
+    
+                """
 
             # 4. Panggil Ollama dengan images=[tmp_path]
             response = self.ollama_client.chat(
@@ -292,8 +303,7 @@ Important:
 
             store_name = self.extract_store_name(content)
             return {
-                "result": store_name,
-                "raw_response": None if store_name != "null" else content
+                "result": store_name
             }
 
         except Exception as e:
@@ -302,6 +312,8 @@ Important:
                 "error": "OCR processing failed",
                 "details": str(e)
             }
+            
+    
 
     # async def process_image_with_ollama(self, image_base64: str) -> dict:
     #     try:
@@ -494,7 +506,7 @@ Important:
             return 'poor'
         return 'very_poor'
 
-    async def process_image_with_ollama(self, image_base64: str) -> dict:
+    def process_image_with_ollama(self, image_base64: str) -> dict:
         try:
             # Strip data URI prefix if present
             if image_base64.startswith('data:image'):
@@ -508,35 +520,38 @@ Important:
             # Call Ollama with Base64 inline (as required by llava)
             response = self.ollama_client.generate(
                 model="llava",
+
                 prompt="""
-                    Analyze the image and extract store information following these steps:  
-                    1. Identify all banners/signage/billboards in the image.  
-                    2. Detect and select the largest/most prominent banner or signage or billboard.  
-                    3. Perform OCR on the selected largest banner/signage/billboard.
-                    4. Ignore all advertisements, promotional text, product brand in banner/signage/billboard.
-                    5. Extract ONLY the store name from the banner/signage/billboard.
-                    6. Return the result in exactly this format (do not modify the format):
-                    {result: "STORE_NAME"}
+                You are an expert OCR agent specialized in store and restaurant signage. Given one image, follow these steps exactly:
 
-                    If no store name is found:
-                    {result: "null"}
+                0. First, determine if the image contains a sign for a store, restaurant, food stall, street‐vendor cart, kiosk, or similar.  
+                1. Detect all text regions in the image.  
+                2. From those, choose the single region that is most prominent (largest text, highest contrast, top or center).  
+                3. Perform OCR on that region—**always return its text**.  
+                4. Within that text, look first for a store or restaurant name (shop sign, storefront banner, food stall name, cart name, kiosk name).  
+                5. If you find a store or restaurant name, output it.  
 
-                    Important:
-                    - Return ONLY the exact store name as seen on the banner/signage
-                    - Do not include any steps, analysis, or additional text
-                    - The response should contain ONLY the {result: "STORE_NAME"} format
+                Return exactly one JSON object, no extra text or fields:
+
+                - If you extracted any text (name or banner):  
+                `{result: "THE_EXTRACTED_TEXT"}`  
+
+                    **Examples:**  
+                    - Image with “WARUNG SARI RASA” sign → `{result: "WARUNG SARI RASA"}`  
+                    - Food cart header “Bakso Pak Joko” → `{result: "Bakso Pak Joko"}`  
+                    - Restaurant awning “RUMAH MAKAN PADANG” → `{result: "RUMAH MAKAN PADANG"}`  
+                    - Kiosk with banner “DRP” → `{result: "DRP"}`  
                 """,
                 # Send Base64 string, not raw bytes
                 images=[base64_data]
-            )
+        )
 
             # Extract response text
             content = response.get("response", "")
             store_name = self.extract_store_name(content) if content else ""
 
             return {
-                "result": store_name,
-                "raw_response": None if store_name else content
+                "result": store_name
             }
 
         except Exception as e:
@@ -560,7 +575,8 @@ Important:
 
         # 3. Panggil fungsi Anda yang lama—sama persis,
         #    hanya inputnya sekarang Base64 hasil pembacaan file
-        return await self.process_image_with_ollama(image_base64)
+        return self.process_image_with_ollama(image_base64)
+        # return self.process_image_with_ollama_chat_image(image_base64)
 
 
 
@@ -579,8 +595,8 @@ Important:
             b64 = base64.b64encode(img_bytes).decode()
 
             # 3. Panggil LLava via ollama.Client
-            response = self.client.generate(
-                model = self.model,
+            response = self.ollama_client.generate(
+                model = "llava",
                 prompt = """
 Analyze the image and extract store information following these steps:  
 1. Identify all banners/signage/billboards in the image.  

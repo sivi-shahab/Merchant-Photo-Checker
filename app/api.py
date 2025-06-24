@@ -9,7 +9,7 @@ from app.logger import logger
 import os
 import requests
 import time
-
+import json
 
 router = APIRouter()
 # processor = ImageProcessor()
@@ -57,7 +57,7 @@ async def health_check():
     # MongoDB check
     try:
         mongo_db.command("ping")
-        mongo_status = "ok"
+        mongo_status = "ok" 
     except Exception as e:
         logger.error(f"MongoDB health check failed: {e}")
         mongo_status = f"error: {str(e)}"
@@ -164,130 +164,6 @@ async def ocr_images_by_reffid(reffid: str):
         logger.error(f"OCR endpoint error for reffid={reffid}: {e}")
         raise HTTPException(status_code=500, detail="Internal OCR processing error")
 
-
-# @router.get("/ocr_merchant/{reffid}")
-# async def ocr_images_by_reffid(reffid: str):
-#     """
-#     Process OCR for all validated images associated with a given reffid.
-#     Returns OCR results and updates MongoDB with the results.
-#     """
-#     try:
-#         # Get document from MongoDB
-#         doc = processor.get_document_by_reffid(reffid)
-#         if not doc:
-#             raise HTTPException(status_code=404, detail="Reffid not found in MongoDB")
-
-#         images = doc.get("images", [])
-#         ocr_results = []
-
-#         for image_data in images:
-#             if not image_data.get("validated"):
-#                 continue
-
-#             try:
-#                 # Process image directly from base64 without temp file
-#                 base64_str = image_data["image_base64"]
-#                 if not base64_str.startswith('data:image'):
-#                     base64_str = f"data:image/jpeg;base64,{base64_str}"
-
-#                 ocr_result = await processor.process_image_with_ollama(base64_str)
-                
-
-#                 # Update MongoDB with OCR result
-#                 update_result = processor.mongo_collection.update_one(
-#                     {"reffid": reffid, "images.elk_id": image_data["elk_id"]},
-#                     {"$set": {"images.$.ocr_result": ocr_result.get("result", "")}}
-#                 )
-
-#                 ocr_results.append({
-#                     "elk_id": image_data["elk_id"],
-#                     "ocr_result": ocr_result.get("result", ""),
-#                     "updated": update_result.modified_count > 0
-#                 })
-
-#             except Exception as img_error:
-#                 logger.error(f"Error processing image {image_data.get('elk_id')}: {str(img_error)}")
-#                 ocr_results.append({
-#                     "elk_id": image_data["elk_id"],
-#                     "error": "Failed to process image",
-#                     "details": str(img_error)
-#                 })
-                
-#         await processor.update_ocr_store_names(processor.postgres_pool, reffid, ocr_results)
-#         return {
-#             "reffid": reffid,
-#             "total_images": len(images),
-#             "processed_images": len(ocr_results),
-#             "ocr_results": ocr_results
-#         }
-
-#     except Exception as e:
-#         logger.error(f"Error in OCR endpoint for reffid {reffid}: {str(e)}")
-#         raise HTTPException(status_code=500, detail=str(e))
-    
-# @router.get("/ocr_merchant/{reffid}")
-# async def ocr_images_by_reffid(reffid: str):
-#     """
-#     Process OCR for all validated images associated with a given reffid.
-#     Returns OCR results and updates MongoDB + Postgres with the results.
-#     """
-#     try:
-#         # Fetch document
-#         doc = processor.get_document_by_reffid(reffid)
-#         if not doc:
-#             raise HTTPException(status_code=404, detail="Reffid not found in MongoDB")
-
-#         images = doc.get("images", [])
-#         ocr_results = []
-
-#         for image_data in images:
-#             if not image_data.get("validated"):
-#                 continue
-
-#             try:
-#                 # Ensure base64 prefix
-#                 b64 = image_data["image_base64"]
-#                 if not b64.startswith('data:image'):
-#                     b64 = f"data:image/jpeg;base64,{b64}"
-
-#                 ocr = await processor.process_image_with_ollama(b64)
-
-#                 # Update MongoDB
-#                 upd = processor.mongo_collection.update_one(
-#                     {"reffid": reffid, "images.elk_id": image_data["elk_id"]},
-#                     {"$set": {"images.$.ocr_result": ocr.get("result", "")}}
-#                 )
-
-#                 ocr_results.append({
-#                     "elk_id": image_data["elk_id"],
-#                     "ocr_result": ocr.get("result", ""),
-#                     "updated": upd.modified_count > 0
-#                 })
-
-#             except Exception as img_err:
-#                 logger.error(f"Error processing image {image_data.get('elk_id')}: {img_err}")
-#                 ocr_results.append({
-#                     "elk_id": image_data.get("elk_id"),
-#                     "error": "Failed to process image",
-#                     "details": str(img_err)
-#                 })
-
-#         # Persist merchant names in Postgres if needed
-#         await processor.update_ocr_store_names(processor.postgres_pool, reffid, ocr_results)
-
-#         return {
-#             "reffid": reffid,
-#             "total_images": len(images),
-#             "processed_images": len(ocr_results),
-#             "ocr_results": ocr_results
-#         }
-
-#     except HTTPException:
-#         raise
-#     except Exception as e:
-#         logger.error(f"Error in OCR endpoint for reffid {reffid}: {e}")
-#         raise HTTPException(status_code=500, detail="Internal server error")
-    
     
 @router.get("/ocr_merchant/{reffid}")
 async def ocr_images_by_reffid(reffid: str):
@@ -313,17 +189,19 @@ async def ocr_images_by_reffid(reffid: str):
                 b64 = image_data.get("image_base64", "")
 
                 # Call updated processor (strips prefix internally)
-                ocr = await processor.process_image_with_ollama(b64)
+                ocr = processor.perform_ocr_from_base64(b64)
+
+                ocr_data = json.loads(ocr) if ocr else {}
 
                 # Update MongoDB
                 upd = processor.mongo_collection.update_one(
                     {"reffid": reffid, "images.elk_id": image_data.get("elk_id")},
-                    {"$set": {"images.$.ocr_result": ocr.get("result", "")} }
+                    {"$set": {"images.$.ocr_result": ocr_data.get("result", "")} }
                 )
 
                 ocr_results.append({
                     "elk_id": image_data.get("elk_id"),
-                    "ocr_result": ocr.get("result", ""),
+                    "ocr_result": ocr_data.get("result", ""),
                     "updated": upd.modified_count > 0
                 })
 
@@ -511,3 +389,145 @@ async def ocr_llava(file: UploadFile = File(...)):
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["details"])
     return result
+
+
+@router.get("/batch-ocr-merchant")
+async def batch_ocr_by_created_date(
+    start_date: str = Query(..., description="ISO date-time (YYYY-MM-DD)"),
+    end_date:   str = Query(..., description="ISO date-time (YYYY-MM-DD)")
+):
+    """
+    Run OCR for every validated image in documents created between
+    `start_date` and `end_date` (inclusive).  
+    Results are written back to MongoDB **and** Postgres.
+    """
+    try:
+        # Ambil semua dokumen dalam rentang tanggal.
+        docs = processor.mongo_collection.find({
+            "created_date": {"$gte": start_date, "$lte": end_date}
+        })
+
+        batch_results = []
+
+        async for doc in docs:         # ← jika .find() di-wrap motor/async
+            reffid  = doc["reffid"]
+            images  = doc.get("images", [])
+            ocr_results = []
+
+            for image_data in images:
+                # Lewati gambar yg belum tervalidasi
+                if not image_data.get("validated"):
+                    continue
+
+                try:
+                    # Base64 sudah cukup – strip prefix dikerjakan di processor
+                    b64 = image_data.get("image_base64", "")
+
+                    ocr = await processor.process_image_with_ollama(b64)
+
+                    # Update Mongo
+                    upd = processor.mongo_collection.update_one(
+                        {"reffid": reffid, "images.elk_id": image_data.get("elk_id")},
+                        {"$set": {"images.$.ocr_result": ocr.get("result", "")}}
+                    )
+
+                    ocr_results.append({
+                        "elk_id":   image_data.get("elk_id"),
+                        "ocr_result": ocr.get("result", ""),
+                        "updated":   upd.modified_count > 0
+                    })
+
+                except Exception as img_err:
+                    logger.error(f"[batch-ocr] {reffid} img {image_data.get('elk_id')} → {img_err}")
+                    ocr_results.append({
+                        "elk_id": image_data.get("elk_id"),
+                        "error":  "Failed to process image",
+                        "details": str(img_err)
+                    })
+
+            # Simpan hasil ke Postgres (nama toko per gambar)
+            await processor.update_ocr_store_names(
+                processor.postgres_pool, reffid, ocr_results
+            )
+
+            batch_results.append({
+                "reffid":            reffid,
+                "total_images":      len(images),
+                "processed_images":  len(ocr_results),
+                "ocr_results":       ocr_results
+            })
+
+        return {
+            "filter": {
+                "start_date": start_date,
+                "end_date":   end_date
+            },
+            "total_reffids":       len(batch_results),
+            "batch_ocr_results":   batch_results
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[batch-ocr] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    
+@router.get("/merchant-tbfu")
+async def get_filtered_company_profiles():
+    """
+    Mengambil data company profile dengan kondisi:
+    - Semua kolom OCR store name (1, 2, 3) adalah NULL
+    - Salah satu dari blur score (1, 2, 3) berisi 'poor'
+    """
+    global postgres_pool
+    
+    # Ensure resources are set up
+    if postgres_pool is None:
+        await setup_resources()
+    
+    try:
+        # Use the global pool instead of creating new connections
+        async with postgres_pool.acquire() as conn:
+            query = """
+            SELECT 
+                mis_date, 
+                reffid, 
+                created_date, 
+                merchant_name, 
+                mid, 
+                ocr_store_name_1, 
+                ocr_store_name_2, 
+                ocr_store_name_3, 
+                blur_score_1, 
+                blur_score_2, 
+                blur_score_3, 
+                ocr_processed_date, 
+                blur_processed_date
+            FROM public.mpos_company_profile
+            WHERE
+            (
+                (CASE WHEN ocr_store_name_1 IS NULL THEN 1 ELSE 0 END) +
+                (CASE WHEN ocr_store_name_2 IS NULL THEN 1 ELSE 0 END) +
+                (CASE WHEN ocr_store_name_3 IS NULL THEN 1 ELSE 0 END)
+            ) >= 2
+            AND (
+                (CASE WHEN blur_score_1 IN ('poor', 'very poor') THEN 1 ELSE 0 END) +
+                (CASE WHEN blur_score_2 IN ('poor', 'very poor') THEN 1 ELSE 0 END) +
+                (CASE WHEN blur_score_3 IN ('poor', 'very poor') THEN 1 ELSE 0 END)
+            ) >= 2
+        ORDER BY created_date DESC;
+            """
+            
+            rows = await conn.fetch(query)
+            
+            if not rows:
+                return []
+            
+            # Convert rows to list of dictionaries
+            result = [dict(row) for row in rows]
+            return result
+            
+    except asyncpg.PostgresError as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
